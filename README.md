@@ -25,6 +25,7 @@ Each successful cleanup writes a **Warning** to the **Application** log under so
 
 <img width="2077" height="1305" alt="image" src="https://github.com/user-attachments/assets/60001ea8-c1b5-4a93-8a4e-9facea3e51d1" />
 
+<img width="1116" height="319" alt="image" src="https://github.com/user-attachments/assets/283d6071-dc66-4633-a4d7-c0917c52e751" />
 
 | Event ID | Meaning |
 |---|---|
