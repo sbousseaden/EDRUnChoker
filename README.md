@@ -1,4 +1,4 @@
-# Unchoker
+# EDRUnChoker
 
 **Fileless WMI remediation for [EDRChoker](https://github.com/TwoSevenOneT/EDRChoker)**  counters QoS abuse (`pacer.sys`) that throttles EDR agents to near-zero network bandwidth.
 
