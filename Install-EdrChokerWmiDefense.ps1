@@ -5,8 +5,8 @@
     Registers a fileless permanent WMI subscription against EDRChoker QoS policies.
 .DESCRIPTION
     Timer-based subscription in root\subscription (no files on disk). Embedded VBScript
-    removes QoS policies that throttle known EDR/security agents (any rate > 0) or apply
-    aggressive throttling (<= 1 Mbps) to app-path policies — including paths without .exe.
+    enumerates QoS policies with WbemContext PolicyStore (ActiveStore + GPO:localhost);
+    plain ExecQuery misses ActiveStore policies created by New-NetQosPolicy / PowerShell.
 #>
 [CmdletBinding()]
 param(
@@ -86,23 +86,10 @@ if (Get-WmiObject -Namespace $WmiNs -Class __EventFilter -Filter "Name='$FilterN
 $creatorSid = Get-LocalAdministratorsCreatorSid
 $wql = "SELECT * FROM __TimerEvent WHERE TimerID = '$TimerId'"
 
-# Detection tiers (embedded — reinstall to update):
-#   1) Known EDR/AV/SIEM process basename or vendor substring + any ThrottleRateAction > 0
-#   2) Any app-path policy with ThrottleRateAction > 0 and <= 1 Mbps (EDRChoker evasion with non-8 values)
-# Path normalization strips .exe and uses the final path segment, so "C:\...\MsMpEng" still matches.
 $scriptText = @'
 On Error Resume Next
 
 Const MAX_THROTTLE_BPS = 1048576
-
-Dim qosSvc, policies, pol
-
-Set qosSvc = GetObject("winmgmts:\\.\root\standardcimv2")
-Set policies = qosSvc.ExecQuery("SELECT * FROM MSFT_NetQosPolicySettingData")
-
-For Each pol In policies
-    If IsMaliciousPolicy(pol) Then RemoveMaliciousPolicy pol
-Next
 
 Sub WriteDefenseLog(eventId, entryType, message)
     Dim proc, pid, cmd, safe
@@ -114,10 +101,24 @@ Sub WriteDefenseLog(eventId, entryType, message)
     proc.Create cmd, Null, Null, pid
 End Sub
 
-Sub RemoveMaliciousPolicy(pol)
+Function GetPolicyAppPath(pol)
+    Dim p
+    p = pol.AppPathNameMatchCondition
+    If Len(Trim(p)) = 0 Then p = pol.AppPathName
+    GetPolicyAppPath = p
+End Function
+
+Function GetPolicyThrottle(pol)
+    Dim t
+    t = GetNumericThrottle(pol.ThrottleRateAction)
+    If t <= 0 Then t = GetNumericThrottle(pol.ThrottleRate)
+    GetPolicyThrottle = t
+End Function
+
+Sub RemoveMaliciousPolicy(pol, storeName)
     Dim appPath, throttle, policyName, instanceId, tier, msg
-    appPath = pol.AppPathNameMatchCondition
-    throttle = GetNumericThrottle(pol.ThrottleRateAction)
+    appPath = GetPolicyAppPath(pol)
+    throttle = GetPolicyThrottle(pol)
     policyName = pol.Name
     instanceId = pol.InstanceID
     If MatchesKnownSecurityTarget(appPath) Then
@@ -127,15 +128,28 @@ Sub RemoveMaliciousPolicy(pol)
     End If
     On Error Resume Next
     pol.Delete_
+    If Err.Number <> 0 Then
+        Err.Clear
+        DeletePolicyViaPowerShell policyName, storeName
+    End If
     If Err.Number = 0 Then
-        msg = "action=remediate qos_policy=" & policyName & " target=" & appPath & " throttle_bps=" & throttle & " tier=" & tier & " instance_id=" & instanceId
+        msg = "action=remediate qos_policy=" & policyName & " target=" & appPath & " throttle_bps=" & throttle & " tier=" & tier & " store=" & storeName & " instance_id=" & instanceId
         WriteDefenseLog 1002, "Warning", msg
     Else
-        msg = "action=remediate_failed qos_policy=" & policyName & " target=" & appPath & " error=" & Err.Description
+        msg = "action=remediate_failed qos_policy=" & policyName & " target=" & appPath & " store=" & storeName & " error=" & Err.Description
         WriteDefenseLog 1003, "Error", msg
         Err.Clear
     End If
     On Error GoTo 0
+End Sub
+
+Sub DeletePolicyViaPowerShell(policyName, storeName)
+    Dim proc, pid, cmd, safeName, safeStore
+    safeName = Replace(policyName, "'", "''")
+    safeStore = Replace(storeName, "'", "''")
+    cmd = "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command ""Remove-NetQosPolicy -Name '" & safeName & "' -PolicyStore '" & safeStore & "' -Confirm:$false -ErrorAction SilentlyContinue"""
+    Set proc = GetObject("winmgmts:\\.\root\cimv2:Win32_Process")
+    proc.Create cmd, Null, Null, pid
 End Sub
 
 Function GetNumericThrottle(val)
@@ -179,7 +193,7 @@ Function MatchesExactTarget(base)
     targets = Array( _
         "amsvc", "cb", "cbdefense", "cetasevc", "cntaosmgr", "cramtray", "crsvc", _
         "cylancesvc", "cybereasonav", "cyserver", "cyveraservice", "cyvrfsflt", _
-        "eiconnector", "ekrn", "elastic-agent", "elastic-endpoint", "endpointbasecamp", _
+        "eiconnector", "ekrn", "elastic-agent", "elastic-defend", "elastic-endpoint", "endpointbasecamp", _
         "executionpreventionsvc", "filebeat", "fortiedr", "hurukai", "logprocessorservice", _
         "mpdefendercoreservice", "msmpeng", "mssense", "ntrtscan", "pccntmon", "qualysagent", _
         "sensecncproxy", "senseir", "sensendr", "sensesampleuploader", "sentinelagent", _
@@ -241,23 +255,44 @@ End Function
 
 Function IsMaliciousPolicy(pol)
     Dim appPath, throttle
-    appPath = pol.AppPathNameMatchCondition
-    throttle = GetNumericThrottle(pol.ThrottleRateAction)
+    IsMaliciousPolicy = False
+    appPath = GetPolicyAppPath(pol)
+    throttle = GetPolicyThrottle(pol)
 
     If Len(Trim(appPath)) = 0 Then Exit Function
     If throttle <= 0 Then Exit Function
 
-    ' Tier 1: any throttle on a known EDR/AV/SIEM target (catches non-8 bps evasion).
     If MatchesKnownSecurityTarget(appPath) Then
         IsMaliciousPolicy = True
         Exit Function
     End If
 
-    ' Tier 2: aggressive throttle on any app-path policy (EDRChoker-style abuse).
     If throttle <= MAX_THROTTLE_BPS Then
         IsMaliciousPolicy = True
     End If
 End Function
+
+Function GetPoliciesForStore(storeName)
+    Dim qosSvc, ctx
+    Set qosSvc = GetObject("winmgmts:\\.\root\standardcimv2")
+    Set ctx = CreateObject("WbemScripting.SWbemNamedValueSet")
+    ctx.Add "PolicyStore", storeName
+    Set GetPoliciesForStore = qosSvc.ExecQuery("SELECT * FROM MSFT_NetQosPolicySettingData", "WQL", , ctx)
+End Function
+
+Sub RunRemediation
+    Dim stores, i, store, policies, pol
+    stores = Array("ActiveStore", "GPO:localhost")
+    For i = 0 To UBound(stores)
+        store = stores(i)
+        Set policies = GetPoliciesForStore(store)
+        For Each pol In policies
+            If IsMaliciousPolicy(pol) Then RemoveMaliciousPolicy pol, store
+        Next
+    Next
+End Sub
+
+RunRemediation
 '@
 
 $null = New-WmiSubscriptionObject -Component 'IntervalTimerInstruction' -ClassName __IntervalTimerInstruction -Properties @{
@@ -295,9 +330,9 @@ Write-Host 'Fileless WMI subscription installed (hardened detection, polls every
 Write-Host "  Timer         : $TimerId (${pollIntervalMs}ms)"
 Write-Host "  Filter        : $FilterName"
 Write-Host "  Consumer      : $ConsumerName (ActiveScriptEventConsumer / VBScript)"
-Write-Host '  Detection     : known EDR targets (any throttle) + app-path throttle <= 1 Mbps'
+Write-Host '  Detection     : WbemContext PolicyStore ActiveStore + GPO:localhost'
 Write-Host "  Event log     : $LogName / Source $LogSource (ID 1002 = remediate, 1003 = failed)"
 Write-Host ''
-Write-Host 'Reinstall was required to update embedded VBScript if upgrading.'
+Write-Host 'Reinstall required when upgrading embedded remediation logic.'
 Write-Host 'Verify: .\Get-EdrChokerDefenseStatus.ps1'
 Write-Host "SOC query  : Get-WinEvent -FilterHashtable @{ LogName='$LogName'; ProviderName='$LogSource' } -MaxEvents 20"

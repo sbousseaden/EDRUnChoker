@@ -37,6 +37,7 @@ foreach ($binding in $bindings) {
     Write-Host 'Removed __FilterToConsumerBinding'
 }
 
+Remove-WmiSubscriptionComponent -Class CommandLineEventConsumer -Filter "Name='$ConsumerName'"
 Remove-WmiSubscriptionComponent -Class ActiveScriptEventConsumer -Filter "Name='$ConsumerName'"
 Remove-WmiSubscriptionComponent -Class __EventFilter -Filter "Name='$FilterName'"
 Remove-WmiSubscriptionComponent -Class __IntervalTimerInstruction -Filter "TimerId='$TimerId'"

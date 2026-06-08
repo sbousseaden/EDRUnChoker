@@ -16,7 +16,7 @@ $MaxThrottleBps = 1048576
 $ExactTargets = @(
     'amsvc', 'cb', 'cbdefense', 'cetasevc', 'cntaosmgr', 'cramtray', 'crsvc',
     'cylancesvc', 'cybereasonav', 'cyserver', 'cyveraservice', 'cyvrfsflt',
-    'eiconnector', 'ekrn', 'elastic-agent', 'elastic-endpoint', 'endpointbasecamp',
+    'eiconnector', 'ekrn', 'elastic-agent', 'elastic-defend', 'elastic-endpoint', 'endpointbasecamp',
     'executionpreventionsvc', 'filebeat', 'fortiedr', 'hurukai', 'logprocessorservice',
     'mpdefendercoreservice', 'msmpeng', 'mssense', 'ntrtscan', 'pccntmon', 'qualysagent',
     'sensecncproxy', 'senseir', 'sensendr', 'sensesampleuploader', 'sentinelagent',
@@ -56,15 +56,44 @@ function Test-KnownSecurityTarget {
     return $false
 }
 
+function Get-PolicyAppPath {
+    param($Policy)
+    $p = [string]$Policy.AppPathNameMatchCondition
+    if ([string]::IsNullOrWhiteSpace($p)) { $p = [string]$Policy.AppPathName }
+    return $p
+}
+
+function Get-PolicyThrottle {
+    param($Policy)
+    foreach ($name in @('ThrottleRateAction', 'ThrottleRateActionBitsPerSecond')) {
+        if ($null -ne $Policy.$name -and [uint64]$Policy.$name -gt 0) {
+            return [uint64]$Policy.$name
+        }
+    }
+    $formatted = [string]$Policy.ThrottleRate
+    if ($formatted -match '^(\d+)') {
+        return [uint64]$Matches[1]
+    }
+    return [uint64]0
+}
+
 function Test-MaliciousQosPolicy {
     param($Policy)
-    $appPath = [string]$Policy.AppPathNameMatchCondition
+    $appPath = Get-PolicyAppPath -Policy $Policy
     if ([string]::IsNullOrWhiteSpace($appPath)) { return $false }
-    $throttle = [uint64]$Policy.ThrottleRateAction
+    $throttle = Get-PolicyThrottle -Policy $Policy
     if ($throttle -eq 0) { return $false }
     if (Test-KnownSecurityTarget -AppPath $appPath) { return $true }
     if ($throttle -le $MaxThrottleBps) { return $true }
     return $false
+}
+
+function Get-AllNetQosPolicies {
+    $all = @()
+    foreach ($store in @('ActiveStore', 'GPO:localhost')) {
+        $all += @(Get-NetQosPolicy -PolicyStore $store -ErrorAction SilentlyContinue)
+    }
+    return $all
 }
 
 Write-Host '=== WMI subscription (root\subscription) ===' -ForegroundColor Cyan
@@ -76,6 +105,10 @@ Get-WmiObject -Namespace $WmiNs -Class __EventFilter -ErrorAction SilentlyContin
     Where-Object { $_.Name -eq $filterName } |
     Format-List Name, Query, EventNamespace
 
+Get-WmiObject -Namespace $WmiNs -Class CommandLineEventConsumer -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq $consumerName } |
+    Format-List Name, CommandLineTemplate
+
 Get-WmiObject -Namespace $WmiNs -Class ActiveScriptEventConsumer -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -eq $consumerName } |
     Format-List Name, ScriptingEngine, KillTimeout
@@ -85,13 +118,19 @@ Get-WmiObject -Namespace $WmiNs -Class __FilterToConsumerBinding -ErrorAction Si
     Format-List Filter, Consumer
 
 Write-Host '=== Policies matching hardened detection rules ===' -ForegroundColor Cyan
-$all = @(Get-CimInstance -Namespace root/standardcimv2 -ClassName MSFT_NetQosPolicySettingData -ErrorAction SilentlyContinue)
+$all = @(Get-AllNetQosPolicies)
 $malicious = @($all | Where-Object { Test-MaliciousQosPolicy -Policy $_ })
 
 Write-Host "Count: $($malicious.Count) / $($all.Count) total QoS policies"
 if ($malicious.Count -gt 0) {
-    $malicious | Select-Object Name, AppPathNameMatchCondition, ThrottleRateAction, Owner |
-        Format-Table -AutoSize
+    $malicious | ForEach-Object {
+        [PSCustomObject]@{
+            Name      = $_.Name
+            AppPath   = (Get-PolicyAppPath -Policy $_)
+            Throttle  = (Get-PolicyThrottle -Policy $_)
+            Owner     = $_.Owner
+        }
+    } | Format-Table -AutoSize
 }
 
 Write-Host '=== Recent remediation events (Application / EDRChokerDefense) ===' -ForegroundColor Cyan

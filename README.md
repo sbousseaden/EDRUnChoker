@@ -2,7 +2,7 @@
 
 **Fileless WMI remediation for [EDRChoker](https://github.com/TwoSevenOneT/EDRChoker)**  counters QoS abuse (`pacer.sys`) that throttles EDR agents to near-zero network bandwidth.
 
-Registers a permanent subscription in `root\subscription` (no files on disk). A 5-second timer runs embedded VBScript that deletes malicious `MSFT_NetQosPolicySettingData` policies targeting known security products or aggressive app-path throttles.
+Registers a permanent subscription in `root\subscription` (no files on disk). A 5-second timer runs embedded VBScript that enumerates QoS policies with **WbemContext `PolicyStore`** on **ActiveStore** and **GPO:localhost** — plain WMI `ExecQuery` misses ActiveStore policies created by `New-NetQosPolicy` / EDRChoker — and removes malicious app-path throttles targeting known security products or aggressive rates (≤ 1 Mbps).
 
 ## Scripts
 
@@ -33,7 +33,7 @@ Each successful cleanup writes a **Warning** to the **Application** log under so
 | 1002 | Malicious QoS policy removed |
 | 1003 | Remediation failed |
 
-**1002 example:** `action=remediate qos_policy=02zxnnzr target=elastic-endpoint.exe throttle_bps=8 tier=tier1-known-edr instance_id={...}`
+**1002 example:** `action=remediate qos_policy=02zxnnzr target=elastic-endpoint.exe throttle_bps=8 tier=tier1-known-edr store=ActiveStore`
 
 ```powershell
 Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='EDRChokerDefense' } -MaxEvents 50
